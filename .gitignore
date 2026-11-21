@@ -9,9 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated data (reproduce with data/generate.py)
-data/*.parquet
-
 # Tool caches and capture scratch space
 .pytest_cache/
 .ruff_cache/

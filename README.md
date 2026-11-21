@@ -26,12 +26,12 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run python data/generate.py --rows 200000 --seed 7
 uv run marimo run notebooks/explorer.py    # app view, code hidden
 uv run marimo edit notebooks/explorer.py   # notebook view, press Run
 ```
 
-The notebook generates the dataset on first run if the file is missing.
+The synthetic dataset is included at `data/cell_kpis.parquet`. To reproduce it exactly, run
+`uv run python data/generate.py --rows 200000 --seed 7`.
 
 ## Using the widget
 
