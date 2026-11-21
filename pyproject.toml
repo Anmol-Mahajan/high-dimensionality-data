@@ -1,0 +1,43 @@
+[project]
+name = "kpi-explorer"
+version = "0.1.0"
+description = "Interactive crossfiltering scatter-plot matrix widget for marimo, demoed on 200k synthetic telecom cell KPIs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anywidget>=0.11.0",
+    "marimo>=0.25.2",
+    "numpy>=2.5.5",
+    "polars>=2.1.0",
+    "pyarrow>=26.0.1",
+    "scikit-learn>=1.9.1",
+    "traitlets>=5.16.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "imageio-ffmpeg>=0.8.1",
+    "matplotlib>=3.11.2",
+    "playwright>=1.65.2",
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["data"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN001"]
+"notebooks/*" = ["ANN", "E501"]
