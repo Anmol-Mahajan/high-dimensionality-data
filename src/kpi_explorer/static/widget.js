@@ -94,7 +94,7 @@ function niceTicks(min, max, target) {
   const rough = (max - min) / target;
   const power = 10 ** Math.floor(Math.log10(rough));
   const ratio = rough / power;
-  const step = (ratio >= 5 ? 10 : ratio >= 2 ? 5 : ratio >= 1.5 ? 2 : 1) * power;
+  const step = (ratio >= 7 ? 10 : ratio >= 3 ? 5 : ratio >= 1.5 ? 2 : 1) * power;
   const ticks = [];
   for (let n = Math.ceil(min / step); n * step <= max; n++) ticks.push(n * step);
   return ticks;

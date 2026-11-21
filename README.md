@@ -89,7 +89,7 @@ exactly. The test suite runs the real `widget.js` under Node and compares every 
 points on vertices and edges, self-crossing polygons, and NaN.
 
 **Canvas layers.** One canvas holds the points, one holds labels, and one holds the brush outline
-and crosshair, so drawing a lasso never forces the points to redraw on its own.
+and crosshair, so the outline and crosshair can update without redrawing any points.
 
 ### Performance log
 
