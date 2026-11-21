@@ -19,6 +19,18 @@ const POLYGON_BUCKETS = 128;
 const MIN_DRAG_CSS = 3;
 const LASSO_STEP_CSS = 2;
 const HINT_DEBOUNCE_MS = 50;
+const LIGHT_TOKENS = {
+  cellColor: "#F3F3EF",
+  unselectedColor: "#C9C9C4",
+  text: "#1A1A1A",
+  muted: "#8A8A85",
+  border: "#E2E2DD",
+  activeBg: "#1A1A1A",
+  activeText: "#FFFFFF",
+  hover: "#F3F3EF",
+  brushStroke: "#000000",
+  brushFill: "rgba(26, 26, 26, 0.08)",
+};
 
 // ---------------------------------------------------------------------------
 // Data decoding
@@ -142,7 +154,7 @@ function applyLayout(view) {
   }
   view.frame = view.pointsContext.createImageData(grid.width, grid.height);
   view.pixels = new Int32Array(view.frame.data.buffer);
-  view.greyLayerValid = false;
+  invalidateLayers(view);
   computePixelCoords(view);
   computeBins(view);
 }
@@ -346,26 +358,40 @@ function storeLayer(view, layer) {
   return out;
 }
 
+function computeTotals(view) {
+  const groups = view.grouping.labels.length;
+  view.totals = computeHistograms(view, view.active, view.activeCount);
+  view.peaks = view.data.names.map((_, f) => histogramPeak(view.totals, f, groups));
+}
+
+function invalidateLayers(view) {
+  view.colorLayerValid = false;
+  view.greyLayerValid = false;
+}
+
 function buildColorLayer(view) {
   clearCells(view);
   const tables = blendTables(view.groupColors, pointAlpha(view.grid, view.activeCount));
   drawMatrix(view, view.active, view.activeCount, tables, view.grouping.codes, 1);
-  const groups = view.grouping.labels.length;
-  view.totals = computeHistograms(view, view.active, view.activeCount);
-  view.peaks = view.data.names.map((_, f) => histogramPeak(view.totals, f, groups));
   view.data.names.forEach((_, f) => {
     drawHistogramCell(view, f, view.totals, view.groupPacked, view.peaks[f]);
   });
   view.colorLayer = storeLayer(view, view.colorLayer);
-  view.greyLayerValid = false;
-  scheduleGreyLayer(view);
+  view.colorLayerValid = true;
 }
 
-// Prepared while the browser is idle so the first brush frame does not pay for it.
-function scheduleGreyLayer(view) {
+// Layers the current frame did not need are prepared while the browser is idle, so the
+// next brush or Clear does not pay for them.
+function scheduleIdleLayers(view) {
+  if (view.idlePending) return;
+  view.idlePending = true;
   const idle = window.requestIdleCallback ?? ((callback) => setTimeout(callback, 1));
   idle(() => {
-    if (!view.greyLayerValid && !view.drag) buildGreyLayer(view);
+    view.idlePending = false;
+    if (view.drag) return;
+    if (!view.greyLayerValid) buildGreyLayer(view);
+    else if (!view.colorLayerValid) buildColorLayer(view);
+    if (!view.colorLayerValid || !view.greyLayerValid) scheduleIdleLayers(view);
   });
 }
 
@@ -384,6 +410,7 @@ function buildGreyLayer(view) {
 function renderFrame(view, interactive) {
   const started = performance.now();
   if (view.selection === null) {
+    if (!view.colorLayerValid) buildColorLayer(view);
     view.pixels.set(view.colorLayer);
   } else {
     if (!view.greyLayerValid) buildGreyLayer(view);
@@ -399,6 +426,7 @@ function renderFrame(view, interactive) {
   }
   view.pointsContext.putImageData(view.frame, 0, 0);
   recordFrame(view, performance.now() - started);
+  if (!view.colorLayerValid || !view.greyLayerValid) scheduleIdleLayers(view);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +697,7 @@ function renderOverlay(view) {
 
 function locateCell(view, event) {
   const { grid } = view;
+  if (!grid) return null;
   const rect = view.overlayCanvas.getBoundingClientRect();
   const x = event.clientX - rect.left - GUTTER.left;
   const y = event.clientY - rect.top - GUTTER.top;
@@ -724,6 +753,7 @@ function onPointerDown(view, event) {
   const hit = locateCell(view, event);
   if (!hit) return;
   event.preventDefault();
+  view.root.focus({ preventScroll: true });
   view.overlayCanvas.setPointerCapture(event.pointerId);
   const start = { x: hit.x, y: hit.y };
   view.drag = {
@@ -782,6 +812,36 @@ function onPointerLeave(view) {
   view.hover = null;
   scheduleHint(view);
   scheduleFrame(view);
+}
+
+function cancelDrag(view) {
+  view.drag = null;
+  dropSelection(view);
+  renderOverlay(view);
+}
+
+const SHORTCUTS = {
+  b: (view) => setBrushMode(view, "box"),
+  l: (view) => setBrushMode(view, "lasso"),
+  k: (view) => pushFilter(view, "keep"),
+  x: (view) => pushFilter(view, "exclude"),
+  r: (view) => resetFilters(view),
+  escape: (view) => dropSelection(view),
+};
+
+function onKeyDown(view, event) {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.target.tagName === "SELECT") return;
+  const key = event.key.toLowerCase();
+  const action = SHORTCUTS[key];
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (view.drag) {
+    if (key === "escape") cancelDrag(view);
+    return;
+  }
+  action(view);
 }
 
 function attachPointerEvents(view) {
@@ -858,9 +918,10 @@ function element(tag, className, text) {
 
 function buildSegment(view, entries) {
   const segment = element("div", "kpi-segment");
-  for (const { id, label, onClick } of entries) {
+  for (const { id, label, title, onClick } of entries) {
     const button = element("button", "kpi-btn", label);
     button.type = "button";
+    if (title) button.title = title;
     button.addEventListener("click", onClick);
     view.buttons[id] = button;
     segment.append(button);
@@ -871,20 +932,72 @@ function buildSegment(view, entries) {
 function buildToolbar(view) {
   view.toolbar.append(
     buildSegment(view, [
-      { id: "keep", label: "Keep", onClick: () => pushFilter(view, "keep") },
-      { id: "exclude", label: "Exclude", onClick: () => pushFilter(view, "exclude") },
-      { id: "clear", label: "Clear", onClick: () => dropSelection(view) },
+      {
+        id: "keep",
+        label: "Keep",
+        title: "Keep only the selected rows (K)",
+        onClick: () => pushFilter(view, "keep"),
+      },
+      {
+        id: "exclude",
+        label: "Exclude",
+        title: "Remove the selected rows (X)",
+        onClick: () => pushFilter(view, "exclude"),
+      },
+      {
+        id: "clear",
+        label: "Clear",
+        title: "Clear the selection (Esc)",
+        onClick: () => dropSelection(view),
+      },
     ]),
-    buildSegment(view, [{ id: "reset", label: "Reset", onClick: () => resetFilters(view) }]),
     buildSegment(view, [
-      { id: "box", label: "Box", onClick: () => setBrushMode(view, "box") },
-      { id: "lasso", label: "Lasso", onClick: () => setBrushMode(view, "lasso") },
+      {
+        id: "reset",
+        label: "Reset",
+        title: "Remove all filters (R)",
+        onClick: () => resetFilters(view),
+      },
     ]),
     buildSegment(view, [
-      { id: "full", label: "Full", onClick: () => setLayoutMode(view, "full") },
-      { id: "lower", label: "Lower", onClick: () => setLayoutMode(view, "lower") },
+      { id: "box", label: "Box", title: "Box select (B)", onClick: () => setBrushMode(view, "box") },
+      {
+        id: "lasso",
+        label: "Lasso",
+        title: "Lasso select (L)",
+        onClick: () => setBrushMode(view, "lasso"),
+      },
     ]),
+    buildSegment(view, [
+      {
+        id: "full",
+        label: "Full",
+        title: "Show the full matrix",
+        onClick: () => setLayoutMode(view, "full"),
+      },
+      {
+        id: "lower",
+        label: "Lower",
+        title: "Show the lower triangle",
+        onClick: () => setLayoutMode(view, "lower"),
+      },
+    ]),
+    buildColorSelect(view),
   );
+}
+
+function buildColorSelect(view) {
+  const wrapper = element("label", "kpi-color", "Colour by");
+  const select = element("select", "kpi-select");
+  for (const { name } of view.data.groupings) {
+    const option = element("option", "", name);
+    option.value = name;
+    select.append(option);
+  }
+  select.value = view.grouping.name;
+  select.addEventListener("change", () => setColorBy(view, select.value));
+  wrapper.append(select);
+  return wrapper;
 }
 
 function updateToolbar(view) {
@@ -950,17 +1063,48 @@ function syncToPython(view) {
 }
 
 function refreshAfterFilterChange(view) {
+  const started = performance.now();
   applyFilters(view);
   rescaleAxes(view);
   computePixelCoords(view);
   computeBins(view);
-  buildColorLayer(view);
-  renderFrame(view, false);
-  renderLabels(view);
-  renderOverlay(view);
+  computeTotals(view);
+  invalidateLayers(view);
   renderStatus(view);
   updateToolbar(view);
+  updateEmptyState(view);
+  recordRebuild(view, "filter", performance.now() - started);
   syncToPython(view);
+  scheduleRepaint(view);
+}
+
+// Axes and counts are prepared in one frame and points are painted in the next, so
+// neither frame exceeds the budget. Labels wait so they change together with the points.
+function scheduleRepaint(view) {
+  cancelAnimationFrame(view.repaintId);
+  view.repaintId = requestAnimationFrame(() => {
+    const started = performance.now();
+    renderFrame(view, false);
+    renderLabels(view);
+    renderOverlay(view);
+    recordRebuild(view, "repaint", performance.now() - started);
+  });
+}
+
+function updateEmptyState(view) {
+  view.empty.hidden = view.activeCount > 0;
+}
+
+function setColorBy(view, name) {
+  const started = performance.now();
+  selectGrouping(view, name);
+  computeTotals(view);
+  view.colorLayerValid = false;
+  renderLegend(view);
+  renderFrame(view, false);
+  recordRebuild(view, "color", performance.now() - started);
+  view.model.set("color", name);
+  view.model.save_changes();
 }
 
 function pushFilter(view, op) {
@@ -1003,13 +1147,83 @@ function setBrushMode(view, mode) {
 }
 
 function setLayoutMode(view, mode) {
+  const started = performance.now();
   view.layoutMode = mode;
   view.hover = null;
   updateToolbar(view);
-  buildColorLayer(view);
+  invalidateLayers(view);
   renderFrame(view, false);
   renderOverlay(view);
   renderStatus(view);
+  recordRebuild(view, "layout", performance.now() - started);
+}
+
+function recordRebuild(view, kind, ms) {
+  if (!view.data.dev) return;
+  const stats = window.__kpiStats;
+  (stats.rebuilds ??= []).push({ kind, ms });
+}
+
+function themeKey() {
+  return `${document.body?.dataset.theme}|${document.body?.className}`;
+}
+
+function cssColorToRgb(value) {
+  const context = (cssColorToRgb.context ??= document
+    .createElement("canvas")
+    .getContext("2d", { willReadFrequently: true }));
+  context.fillStyle = "#000000";
+  context.fillStyle = value;
+  context.fillRect(0, 0, 1, 1);
+  const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+  return { r, g, b };
+}
+
+function readTokens(root) {
+  const body = document.body;
+  if (body?.dataset.theme !== "dark" && !body?.classList.contains("dark")) return LIGHT_TOKENS;
+  const style = getComputedStyle(root);
+  const read = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+  const background = read("--background", "#181C1A");
+  const foreground = read("--foreground", "#ECEEED");
+  return {
+    cellColor: read("--card", "#252927"),
+    unselectedColor: "#5A605D",
+    text: foreground,
+    muted: read("--muted-foreground", "#AAB2AF"),
+    border: read("--border", "#3B403E"),
+    activeBg: foreground,
+    activeText: background,
+    hover: read("--card", "#252927"),
+    brushStroke: foreground,
+    brushFill: "rgba(255, 255, 255, 0.10)",
+  };
+}
+
+function applyTheme(view) {
+  const tokens = readTokens(view.root);
+  view.themeKey = themeKey();
+  view.theme = {
+    ...tokens,
+    cell: cssColorToRgb(tokens.cellColor),
+    unselected: cssColorToRgb(tokens.unselectedColor),
+  };
+  const { style } = view.root;
+  style.setProperty("--kpi-text", tokens.text);
+  style.setProperty("--kpi-muted", tokens.muted);
+  style.setProperty("--kpi-border", tokens.border);
+  style.setProperty("--kpi-cell", tokens.cellColor);
+  style.setProperty("--kpi-active-bg", tokens.activeBg);
+  style.setProperty("--kpi-active-text", tokens.activeText);
+  style.setProperty("--kpi-hover", tokens.hover);
+}
+
+function watchTheme(view) {
+  const observer = new MutationObserver(() => {
+    if (themeKey() !== view.themeKey) renderAll(view);
+  });
+  observer.observe(document.body, { attributes: true, attributeFilter: ["class", "data-theme"] });
+  return observer;
 }
 
 function recordFrame(view, ms) {
@@ -1062,14 +1276,6 @@ function createView(model, el) {
       columns: decodeColumns(model.get("_columns"), meta.rows, names.length),
       groupings: decodeGroupings(model.get("_groups"), meta.rows, meta.groups),
     },
-    theme: {
-      cell: parseColor("#F3F3EF"),
-      unselected: parseColor("#C9C9C4"),
-      text: "#1A1A1A",
-      muted: "#8A8A85",
-      brushStroke: "#000000",
-      brushFill: "rgba(26, 26, 26, 0.08)",
-    },
     brushMode: "box",
     layoutMode: "full",
     selection: null,
@@ -1087,7 +1293,12 @@ function createView(model, el) {
     pointsCanvas: element("canvas"),
     labelsCanvas: element("canvas"),
     overlayCanvas: element("canvas", "kpi-overlay"),
+    empty: element("div", "kpi-empty"),
   };
+  view.empty.append(
+    element("span", "kpi-empty-message", "No rows match these filters. Press Reset to start over."),
+  );
+  view.root.tabIndex = 0;
   view.pointsContext = view.pointsCanvas.getContext("2d", { alpha: true });
   view.labelsContext = view.labelsCanvas.getContext("2d");
   view.overlayContext = view.overlayCanvas.getContext("2d");
@@ -1098,16 +1309,17 @@ function createView(model, el) {
   view.selected = new Uint32Array(meta.rows);
   view.zeroCodes = new Uint8Array(meta.rows);
 
-  view.stage.append(view.pointsCanvas, view.labelsCanvas, view.overlayCanvas);
+  view.stage.append(view.pointsCanvas, view.labelsCanvas, view.overlayCanvas, view.empty);
   view.root.append(view.legend, view.status, view.toolbar, view.stage);
   el.append(view.root);
   return view;
 }
 
 function renderAll(view) {
+  applyTheme(view);
   applyLayout(view);
   if (!view.grid) return;
-  buildColorLayer(view);
+  computeTotals(view);
   renderFrame(view, false);
   renderLabels(view);
   renderOverlay(view);
@@ -1124,7 +1336,10 @@ function render({ model, el }) {
   renderLegend(view);
   renderStatus(view);
   renderAll(view);
+  updateEmptyState(view);
   attachPointerEvents(view);
+  view.root.addEventListener("keydown", (event) => onKeyDown(view, event));
+  const themeObserver = watchTheme(view);
 
   let lastWidth = view.stage.clientWidth;
   const observer = new ResizeObserver(() => {
@@ -1136,7 +1351,9 @@ function render({ model, el }) {
   observer.observe(view.stage);
   return () => {
     observer.disconnect();
+    themeObserver.disconnect();
     cancelAnimationFrame(view.frameId);
+    cancelAnimationFrame(view.repaintId);
     clearTimeout(view.hintTimer);
   };
 }

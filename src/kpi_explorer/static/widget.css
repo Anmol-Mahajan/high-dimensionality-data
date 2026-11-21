@@ -112,5 +112,50 @@
 }
 
 .kpi-overlay {
+  cursor: crosshair;
   touch-action: none;
+}
+
+.kpi-color {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--kpi-muted);
+}
+
+.kpi-select {
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--kpi-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--kpi-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.kpi-select option {
+  color: #1a1a1a;
+}
+
+.kpi-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.kpi-empty[hidden] {
+  display: none;
+}
+
+.kpi-empty-message {
+  padding: 8px 14px;
+  border: 1px solid var(--kpi-border);
+  border-radius: 6px;
+  background: var(--background, #ffffff);
+  color: var(--kpi-text);
+  font-size: 13px;
 }

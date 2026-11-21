@@ -80,5 +80,42 @@ def _(mo, pp):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo, pl, pp):
+    worst = (
+        pp.selected_df()
+        .group_by("cell_id", "region")
+        .agg(
+            pl.len().alias("rows"),
+            pl.col("packet_loss_pct").mean().round(2),
+            pl.col("latency_ms").mean().round(1),
+            pl.col("sinr_db").mean().round(1),
+            pl.col("true_state").mode().sort().first().alias("typical_state"),
+        )
+        .filter(pl.col("rows") >= 3)
+        .sort(["packet_loss_pct", "cell_id"], descending=[True, False])
+        .head(10)
+    )
+    worst_table = "\n".join(
+        [
+            "| cell | region | rows | packet loss % | latency ms | SINR dB | typical state |",
+            "|---|---|---:|---:|---:|---:|---|",
+            *(
+                f"| `{row['cell_id']}` | {row['region']} | {row['rows']:,} "
+                f"| {row['packet_loss_pct']:.2f} | {row['latency_ms']:.1f} "
+                f"| {row['sinr_db']:.1f} | {row['typical_state']} |"
+                for row in worst.iter_rows(named=True)
+            ),
+        ]
+    )
+    body = "No cell has 3 or more rows in this selection." if worst.is_empty() else worst_table
+    mo.md(
+        "### 10 worst cells in the current selection\n\n"
+        "Ranked by mean packet loss, among cells with at least 3 selected rows.\n\n"
+        f"{body}"
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()
