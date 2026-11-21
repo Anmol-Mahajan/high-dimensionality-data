@@ -13,6 +13,12 @@ const CELL_GAP = 1;
 const MIN_CELL = 64;
 const DOMAIN_PADDING = 0.04;
 const HIST_HEADROOM_CSS = 20;
+const UNSELECTED_ALPHA = 0.35;
+const LIVE_POINT_BUDGET = 70_000;
+const POLYGON_BUCKETS = 128;
+const MIN_DRAG_CSS = 3;
+const LASSO_STEP_CSS = 2;
+const HINT_DEBOUNCE_MS = 50;
 
 // ---------------------------------------------------------------------------
 // Data decoding
@@ -135,6 +141,7 @@ function applyLayout(view) {
   }
   view.frame = view.pointsContext.createImageData(grid.width, grid.height);
   view.pixels = new Int32Array(view.frame.data.buffer);
+  view.greyLayerValid = false;
   computePixelCoords(view);
   computeBins(view);
 }
@@ -242,7 +249,7 @@ function clearCells(view) {
   }
 }
 
-function drawScatterCell(view, row, col, rows, count, tables, codes) {
+function drawScatterCell(view, row, col, rows, count, tables, codes, stride) {
   const { pixels } = view;
   const { width, cellPx } = view.grid;
   const xs = view.pixelCoords[col];
@@ -250,7 +257,7 @@ function drawScatterCell(view, row, col, rows, count, tables, codes) {
   const origin = cellOrigin(view, row, col);
   const top = cellPx - 1;
   const { rb, g, inverse } = tables;
-  for (let k = 0; k < count; k++) {
+  for (let k = 0; k < count; k += stride) {
     const r = rows[k];
     const px = xs[r];
     const py = ys[r];
@@ -282,20 +289,24 @@ function mirrorScatterCell(view, row, col) {
   }
 }
 
-function drawHistogramCell(view, feature, counts) {
-  const { cellPx, stepPx, leftPx, topPx, dpr } = view.grid;
-  const groups = view.grouping.labels.length;
-  const x0 = leftPx + feature * stepPx;
-  const y0 = topPx + feature * stepPx;
-  const usable = cellPx - Math.round(HIST_HEADROOM_CSS * dpr);
+function histogramPeak(counts, feature, groups) {
   const base = feature * HIST_BINS;
-
   let peak = 1;
   for (let bin = 0; bin < HIST_BINS; bin++) {
     let total = 0;
     for (let g = 0; g < groups; g++) total += counts[(base + bin) * groups + g];
     if (total > peak) peak = total;
   }
+  return peak;
+}
+
+function drawHistogramCell(view, feature, counts, colors, peak) {
+  const { cellPx, stepPx, leftPx, topPx, dpr } = view.grid;
+  const groups = view.grouping.labels.length;
+  const x0 = leftPx + feature * stepPx;
+  const y0 = topPx + feature * stepPx;
+  const usable = cellPx - Math.round(HIST_HEADROOM_CSS * dpr);
+  const base = feature * HIST_BINS;
 
   const barGap = Math.max(1, Math.round(dpr / 2));
   for (let bin = 0; bin < HIST_BINS; bin++) {
@@ -311,37 +322,446 @@ function drawHistogramCell(view, feature, counts) {
       if (upper > lower) {
         fillPixels(
           view, left, y0 + cellPx - upper, Math.max(1, right - left), upper - lower,
-          view.groupPacked[g],
+          colors[g],
         );
       }
     }
   }
 }
 
-function renderPoints(view) {
-  const started = performance.now();
-  const { count } = view.grid;
-  clearCells(view);
-  const cleared = performance.now();
-  const tables = blendTables(view.groupColors, pointAlpha(view.grid, view.activeCount));
-  for (let row = 1; row < count; row++) {
+function drawMatrix(view, rows, count, tables, codes, stride) {
+  const features = view.grid.count;
+  for (let row = 1; row < features; row++) {
     for (let col = 0; col < row; col++) {
-      drawScatterCell(view, row, col, view.active, view.activeCount, tables, view.grouping.codes);
+      drawScatterCell(view, row, col, rows, count, tables, codes, stride);
       if (view.layoutMode === "full") mirrorScatterCell(view, row, col);
     }
   }
-  const scattered = performance.now();
-  const counts = computeHistograms(view, view.active, view.activeCount);
-  for (let f = 0; f < count; f++) drawHistogramCell(view, f, counts);
-  const histogrammed = performance.now();
-  view.pointsContext.putImageData(view.frame, 0, 0);
-  const finished = performance.now();
-  recordFrame(view, finished - started, {
-    clear: cleared - started,
-    scatter: scattered - cleared,
-    histogram: histogrammed - scattered,
-    put: finished - histogrammed,
+}
+
+function storeLayer(view, layer) {
+  const out = layer?.length === view.pixels.length ? layer : new Int32Array(view.pixels.length);
+  out.set(view.pixels);
+  return out;
+}
+
+function buildColorLayer(view) {
+  clearCells(view);
+  const tables = blendTables(view.groupColors, pointAlpha(view.grid, view.activeCount));
+  drawMatrix(view, view.active, view.activeCount, tables, view.grouping.codes, 1);
+  const groups = view.grouping.labels.length;
+  view.totals = computeHistograms(view, view.active, view.activeCount);
+  view.peaks = view.data.names.map((_, f) => histogramPeak(view.totals, f, groups));
+  view.data.names.forEach((_, f) => {
+    drawHistogramCell(view, f, view.totals, view.groupPacked, view.peaks[f]);
   });
+  view.colorLayer = storeLayer(view, view.colorLayer);
+  view.greyLayerValid = false;
+  scheduleGreyLayer(view);
+}
+
+// Prepared while the browser is idle so the first brush frame does not pay for it.
+function scheduleGreyLayer(view) {
+  const idle = window.requestIdleCallback ?? ((callback) => setTimeout(callback, 1));
+  idle(() => {
+    if (!view.greyLayerValid && !view.drag) buildGreyLayer(view);
+  });
+}
+
+function buildGreyLayer(view) {
+  clearCells(view);
+  const tables = blendTables([view.theme.unselected], UNSELECTED_ALPHA);
+  drawMatrix(view, view.active, view.activeCount, tables, view.zeroCodes, 1);
+  const grey = view.grouping.labels.map(() => packColor(view.theme.unselected));
+  view.data.names.forEach((_, f) => drawHistogramCell(view, f, view.totals, grey, view.peaks[f]));
+  view.greyLayer = storeLayer(view, view.greyLayer);
+  view.greyLayerValid = true;
+}
+
+// While dragging, large selections are drawn with a stride and a higher alpha so the
+// frame stays cheap. Counts and histograms always use every selected row.
+function renderFrame(view, interactive) {
+  const started = performance.now();
+  if (view.selection === null) {
+    view.pixels.set(view.colorLayer);
+  } else {
+    if (!view.greyLayerValid) buildGreyLayer(view);
+    view.pixels.set(view.greyLayer);
+    const stride = interactive ? Math.max(1, Math.ceil(view.selectedCount / LIVE_POINT_BUDGET)) : 1;
+    const drawn = view.selectedCount / stride;
+    const tables = blendTables(view.groupColors, pointAlpha(view.grid, drawn));
+    drawMatrix(view, view.selected, view.selectedCount, tables, view.grouping.codes, stride);
+    const counts = computeHistograms(view, view.selected, view.selectedCount);
+    view.data.names.forEach((_, f) => {
+      drawHistogramCell(view, f, counts, view.groupPacked, view.peaks[f]);
+    });
+  }
+  view.pointsContext.putImageData(view.frame, 0, 0);
+  recordFrame(view, performance.now() - started);
+}
+
+// ---------------------------------------------------------------------------
+// Selection geometry
+// ---------------------------------------------------------------------------
+
+export function pointInPolygon(x, y, polygon) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Buckets edges by y so each point only tests the few edges near its scanline. Edges that
+// do not straddle y never toggle the result, so this matches pointInPolygon exactly.
+function buildPolygonIndex(polygon) {
+  const ys = polygon.map((vertex) => vertex[1]);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const scale = POLYGON_BUCKETS / (maxY - minY || 1);
+  const lists = Array.from({ length: POLYGON_BUCKETS }, () => []);
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    const first = Math.min(POLYGON_BUCKETS - 1, Math.floor((Math.min(yi, yj) - minY) * scale));
+    const last = Math.min(POLYGON_BUCKETS - 1, Math.floor((Math.max(yi, yj) - minY) * scale));
+    for (let b = first; b <= last; b++) lists[b].push(xi, yi, xj, yj);
+  }
+  return { minY, maxY, scale, buckets: lists.map((list) => Float64Array.from(list)) };
+}
+
+function indexedPointInPolygon(index, x, y) {
+  if (!(y >= index.minY && y < index.maxY)) return false;
+  const bucket = Math.min(POLYGON_BUCKETS - 1, Math.floor((y - index.minY) * index.scale));
+  const edges = index.buckets[bucket];
+  let inside = false;
+  for (let e = 0; e < edges.length; e += 4) {
+    const xi = edges[e];
+    const yi = edges[e + 1];
+    const xj = edges[e + 2];
+    const yj = edges[e + 3];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function collectRange(xs, [low, high], active, count, mask, out) {
+  let matched = 0;
+  for (let k = 0; k < count; k++) {
+    const r = active[k];
+    const x = xs[r];
+    if (x >= low && x <= high) {
+      mask[r] = 1;
+      out[matched++] = r;
+    }
+  }
+  return matched;
+}
+
+function collectBox(xs, ys, [xLow, xHigh, yLow, yHigh], active, count, mask, out) {
+  let matched = 0;
+  for (let k = 0; k < count; k++) {
+    const r = active[k];
+    const x = xs[r];
+    const y = ys[r];
+    if (x >= xLow && x <= xHigh && y >= yLow && y <= yHigh) {
+      mask[r] = 1;
+      out[matched++] = r;
+    }
+  }
+  return matched;
+}
+
+function collectLasso(xs, ys, polygon, active, count, mask, out) {
+  const index = buildPolygonIndex(polygon);
+  let matched = 0;
+  for (let k = 0; k < count; k++) {
+    const r = active[k];
+    if (indexedPointInPolygon(index, xs[r], ys[r])) {
+      mask[r] = 1;
+      out[matched++] = r;
+    }
+  }
+  return matched;
+}
+
+export function selectRows(selection, columns, active, activeCount, mask, out) {
+  mask.fill(0);
+  const xs = columns[selection.x_index];
+  if (selection.type === "range") {
+    return collectRange(xs, selection.bounds, active, activeCount, mask, out);
+  }
+  const ys = columns[selection.y_index];
+  if (selection.type === "box") {
+    return collectBox(xs, ys, selection.bounds, active, activeCount, mask, out);
+  }
+  return collectLasso(xs, ys, selection.polygon, active, activeCount, mask, out);
+}
+
+function fractionToData(view, feature, fraction) {
+  const [min, max] = view.domains[feature];
+  return min + fraction * (max - min);
+}
+
+function dataToFraction(view, feature, value) {
+  const [min, max] = view.domains[feature];
+  return (value - min) / (max - min);
+}
+
+function buildSelection(view, drag) {
+  const { row, col, kind, start, current, points } = drag;
+  const { cell } = view.grid;
+  const { names } = view.data;
+  const dataX = (x) => fractionToData(view, col, x / cell);
+  const dataY = (y) => fractionToData(view, row, 1 - y / cell);
+  if (kind === "range") {
+    const [a, b] = [dataX(start.x), dataX(current.x)];
+    return {
+      type: "range", x_index: col, y_index: null, x_name: names[col], y_name: null,
+      bounds: [Math.min(a, b), Math.max(a, b)],
+    };
+  }
+  const axes = { x_index: col, y_index: row, x_name: names[col], y_name: names[row] };
+  if (kind === "box") {
+    const [x0, x1] = [dataX(start.x), dataX(current.x)];
+    const [y0, y1] = [dataY(start.y), dataY(current.y)];
+    return {
+      type: "box", ...axes,
+      bounds: [Math.min(x0, x1), Math.max(x0, x1), Math.min(y0, y1), Math.max(y0, y1)],
+    };
+  }
+  if (points.length < 3) return null;
+  return { type: "lasso", ...axes, polygon: points.map(([x, y]) => [dataX(x), dataY(y)]) };
+}
+
+function applyDragSelection(view, drag) {
+  const selection = buildSelection(view, drag);
+  if (selection === null) return false;
+  view.selection = selection;
+  view.selectedCount = selectRows(
+    selection, view.data.columns, view.active, view.activeCount, view.mask, view.selected,
+  );
+  return true;
+}
+
+function clearSelection(view) {
+  view.selection = null;
+  view.selectedCount = 0;
+  view.mask.fill(0);
+}
+
+// ---------------------------------------------------------------------------
+// Overlay
+// ---------------------------------------------------------------------------
+
+function cellLeft(view, col) {
+  return GUTTER.left + col * (view.grid.cell + CELL_GAP);
+}
+
+function cellTop(view, row) {
+  return GUTTER.top + row * (view.grid.cell + CELL_GAP);
+}
+
+function traceSelection(view, ctx, selection) {
+  const { cell } = view.grid;
+  const col = selection.x_index;
+  const row = selection.y_index ?? col;
+  const left = cellLeft(view, col);
+  const top = cellTop(view, row);
+  const toX = (value) => left + dataToFraction(view, col, value) * cell;
+  const toY = (value) => top + (1 - dataToFraction(view, row, value)) * cell;
+  ctx.beginPath();
+  if (selection.type === "range") {
+    const [low, high] = selection.bounds;
+    ctx.rect(toX(low), top, toX(high) - toX(low), cell);
+  } else if (selection.type === "box") {
+    const [xLow, xHigh, yLow, yHigh] = selection.bounds;
+    ctx.rect(toX(xLow), toY(yHigh), toX(xHigh) - toX(xLow), toY(yLow) - toY(yHigh));
+  } else {
+    selection.polygon.forEach(([x, y], i) => {
+      if (i === 0) ctx.moveTo(toX(x), toY(y));
+      else ctx.lineTo(toX(x), toY(y));
+    });
+    ctx.closePath();
+  }
+}
+
+function drawSelectionOutline(view, ctx, selection) {
+  const { cell } = view.grid;
+  const col = selection.x_index;
+  const row = selection.y_index ?? col;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(cellLeft(view, col), cellTop(view, row), cell, cell);
+  ctx.clip();
+  traceSelection(view, ctx, selection);
+  ctx.fillStyle = view.theme.brushFill;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = view.theme.brushStroke;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCrosshair(view, ctx, hover) {
+  const { cell } = view.grid;
+  const left = cellLeft(view, hover.col);
+  const top = cellTop(view, hover.row);
+  ctx.save();
+  ctx.strokeStyle = view.theme.muted;
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const x = Math.round(left + hover.x) + 0.5;
+  ctx.moveTo(x, top);
+  ctx.lineTo(x, top + cell);
+  if (hover.row !== hover.col) {
+    const y = Math.round(top + hover.y) + 0.5;
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + cell, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function renderOverlay(view) {
+  const { overlayContext: ctx, grid } = view;
+  ctx.setTransform(grid.dpr, 0, 0, grid.dpr, 0, 0);
+  ctx.clearRect(0, 0, grid.cssWidth, grid.cssHeight);
+  if (view.selection) drawSelectionOutline(view, ctx, view.selection);
+  if (!view.drag && view.hover) drawCrosshair(view, ctx, view.hover);
+}
+
+// ---------------------------------------------------------------------------
+// Pointer interaction
+// ---------------------------------------------------------------------------
+
+function locateCell(view, event) {
+  const { grid } = view;
+  const rect = view.overlayCanvas.getBoundingClientRect();
+  const x = event.clientX - rect.left - GUTTER.left;
+  const y = event.clientY - rect.top - GUTTER.top;
+  const step = grid.cell + CELL_GAP;
+  const col = Math.floor(x / step);
+  const row = Math.floor(y / step);
+  if (col < 0 || row < 0 || col >= grid.count || row >= grid.count) return null;
+  if (!isCellVisible(view, row, col)) return null;
+  const cellX = x - col * step;
+  const cellY = y - row * step;
+  if (cellX >= grid.cell || cellY >= grid.cell) return null;
+  return { row, col, x: cellX, y: cellY };
+}
+
+function clampToDragCell(view, drag, event) {
+  const rect = view.overlayCanvas.getBoundingClientRect();
+  const { cell } = view.grid;
+  const x = event.clientX - rect.left - cellLeft(view, drag.col);
+  const y = event.clientY - rect.top - cellTop(view, drag.row);
+  return { x: Math.max(0, Math.min(cell, x)), y: Math.max(0, Math.min(cell, y)) };
+}
+
+function scheduleFrame(view) {
+  if (view.frameId) return;
+  view.frameId = requestAnimationFrame(() => {
+    view.frameId = 0;
+    flushFrame(view);
+  });
+}
+
+function flushFrame(view) {
+  const { drag } = view;
+  if (drag?.dirty && drag.moved) {
+    const started = performance.now();
+    drag.dirty = false;
+    applyDragSelection(view, drag);
+    renderFrame(view, true);
+    renderOverlay(view);
+    renderStatus(view);
+    recordBrushFrame(view, performance.now() - started);
+    return;
+  }
+  renderOverlay(view);
+}
+
+function scheduleHint(view) {
+  clearTimeout(view.hintTimer);
+  view.hintTimer = setTimeout(() => renderStatus(view), HINT_DEBOUNCE_MS);
+}
+
+function onPointerDown(view, event) {
+  if (event.button !== 0) return;
+  const hit = locateCell(view, event);
+  if (!hit) return;
+  event.preventDefault();
+  view.overlayCanvas.setPointerCapture(event.pointerId);
+  const start = { x: hit.x, y: hit.y };
+  view.drag = {
+    row: hit.row,
+    col: hit.col,
+    kind: hit.row === hit.col ? "range" : view.brushMode,
+    start,
+    current: start,
+    points: [[start.x, start.y]],
+    moved: false,
+    dirty: false,
+  };
+  scheduleFrame(view);
+}
+
+function onPointerMove(view, event) {
+  const { drag } = view;
+  if (!drag) {
+    const previous = view.hover;
+    view.hover = locateCell(view, event);
+    if (previous?.row !== view.hover?.row || previous?.col !== view.hover?.col) scheduleHint(view);
+    scheduleFrame(view);
+    return;
+  }
+  const point = clampToDragCell(view, drag, event);
+  drag.current = point;
+  if (Math.hypot(point.x - drag.start.x, point.y - drag.start.y) >= MIN_DRAG_CSS) {
+    drag.moved = true;
+  }
+  if (drag.kind === "lasso") {
+    const [lastX, lastY] = drag.points[drag.points.length - 1];
+    if (Math.hypot(point.x - lastX, point.y - lastY) >= LASSO_STEP_CSS) {
+      drag.points.push([point.x, point.y]);
+    }
+  }
+  drag.dirty = true;
+  scheduleFrame(view);
+}
+
+function onPointerUp(view, event) {
+  const { drag } = view;
+  if (!drag) return;
+  view.drag = null;
+  if (!drag.moved || !applyDragSelection(view, drag)) clearSelection(view);
+  view.hover = locateCell(view, event);
+  renderFrame(view, false);
+  renderOverlay(view);
+  renderStatus(view);
+  updateToolbar(view);
+  logBrushStats(view);
+}
+
+function onPointerLeave(view) {
+  if (view.drag) return;
+  view.hover = null;
+  scheduleHint(view);
+  scheduleFrame(view);
+}
+
+function attachPointerEvents(view) {
+  const canvas = view.overlayCanvas;
+  canvas.addEventListener("pointerdown", (event) => onPointerDown(view, event));
+  canvas.addEventListener("pointermove", (event) => onPointerMove(view, event));
+  canvas.addEventListener("pointerup", (event) => onPointerUp(view, event));
+  canvas.addEventListener("pointercancel", (event) => onPointerUp(view, event));
+  canvas.addEventListener("pointerleave", () => onPointerLeave(view));
 }
 
 // ---------------------------------------------------------------------------
@@ -460,31 +880,81 @@ function renderLegend(view) {
   );
 }
 
+function hintText(view) {
+  const verb = view.brushMode === "lasso" ? "lasso" : "box";
+  if (!view.hover) return `drag a ${verb} in any cell`;
+  const { row, col } = view.hover;
+  const { names } = view.data;
+  if (row === col) return `${names[col]} · drag a range`;
+  const action = view.brushMode === "lasso" ? "drag to lasso" : "drag a box";
+  return `${names[col]} × ${names[row]} · ${action}`;
+}
+
 function renderStatus(view) {
-  view.status.textContent = "drag a box in any cell";
+  const total = view.data.rows;
+  const filterCount = view.filters.length;
+  const filterText = filterCount ? ` · ${filterCount} filter${filterCount === 1 ? "" : "s"}` : "";
+  let count = null;
+  let suffix = hintText(view);
+  if (view.selection) {
+    count = view.selectedCount;
+    const share = Math.round((count / total) * 100);
+    suffix = ` of ${total.toLocaleString("en-US")} rows · ${share}%${filterText}`;
+  } else if (filterCount) {
+    count = view.activeCount;
+    suffix = ` of ${total.toLocaleString("en-US")} rows${filterText} · ${suffix}`;
+  }
+  const key = `${count}|${suffix}`;
+  if (key === view.statusKey) return;
+  view.statusKey = key;
+  if (count === null) {
+    view.status.textContent = suffix;
+  } else {
+    view.status.replaceChildren(element("strong", "", count.toLocaleString("en-US")), suffix);
+  }
 }
 
 function setBrushMode(view, mode) {
   view.brushMode = mode;
   updateToolbar(view);
+  renderStatus(view);
 }
 
 function setLayoutMode(view, mode) {
   view.layoutMode = mode;
+  view.hover = null;
   updateToolbar(view);
-  renderPoints(view);
+  buildColorLayer(view);
+  renderFrame(view, false);
+  renderOverlay(view);
+  renderStatus(view);
 }
 
-function recordFrame(view, ms, stages) {
+function recordFrame(view, ms) {
   if (!view.data.dev) return;
-  const stats = (window.__kpiStats ??= { frames: [] });
+  const stats = (window.__kpiStats ??= { frames: [], brush: [] });
+  window.__kpiView = view;
   stats.frames.push(ms);
   stats.last = ms;
-  stats.stages = stages;
   if (stats.firstPaint === undefined) {
     stats.firstPaint = performance.now() - view.startedAt;
     stats.firstPaintSinceNavigation = performance.now();
   }
+}
+
+function recordBrushFrame(view, ms) {
+  if (view.data.dev) window.__kpiStats.brush.push(ms);
+}
+
+function logBrushStats(view) {
+  if (!view.data.dev) return;
+  const frames = [...window.__kpiStats.brush].sort((a, b) => a - b);
+  if (!frames.length) return;
+  const median = frames[Math.floor(frames.length / 2)];
+  console.debug(
+    `[kpi] brush frames: ${frames.length}, median ${median.toFixed(1)} ms, ` +
+      `max ${frames[frames.length - 1].toFixed(1)} ms`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -510,9 +980,22 @@ function createView(model, el) {
       columns: decodeColumns(model.get("_columns"), meta.rows, names.length),
       groupings: decodeGroupings(model.get("_groups"), meta.rows, meta.groups),
     },
-    theme: { cell: parseColor("#F3F3EF"), text: "#1A1A1A", muted: "#8A8A85" },
+    theme: {
+      cell: parseColor("#F3F3EF"),
+      unselected: parseColor("#C9C9C4"),
+      text: "#1A1A1A",
+      muted: "#8A8A85",
+      brushStroke: "#000000",
+      brushFill: "rgba(26, 26, 26, 0.08)",
+    },
     brushMode: "box",
     layoutMode: "full",
+    selection: null,
+    selectedCount: 0,
+    filters: [],
+    drag: null,
+    hover: null,
+    frameId: 0,
     buttons: {},
     root: element("div", "kpi-root"),
     legend: element("div", "kpi-legend"),
@@ -529,6 +1012,9 @@ function createView(model, el) {
   view.active = new Uint32Array(meta.rows);
   for (let r = 0; r < meta.rows; r++) view.active[r] = r;
   view.activeCount = meta.rows;
+  view.mask = new Uint8Array(meta.rows);
+  view.selected = new Uint32Array(meta.rows);
+  view.zeroCodes = new Uint8Array(meta.rows);
 
   view.stage.append(view.pointsCanvas, view.labelsCanvas, view.overlayCanvas);
   view.root.append(view.legend, view.status, view.toolbar, view.stage);
@@ -539,8 +1025,10 @@ function createView(model, el) {
 function renderAll(view) {
   applyLayout(view);
   if (!view.grid) return;
-  renderPoints(view);
+  buildColorLayer(view);
+  renderFrame(view, false);
   renderLabels(view);
+  renderOverlay(view);
 }
 
 function render({ model, el }) {
@@ -552,6 +1040,7 @@ function render({ model, el }) {
   renderLegend(view);
   renderStatus(view);
   renderAll(view);
+  attachPointerEvents(view);
 
   let lastWidth = view.stage.clientWidth;
   const observer = new ResizeObserver(() => {
@@ -561,7 +1050,11 @@ function render({ model, el }) {
     renderAll(view);
   });
   observer.observe(view.stage);
-  return () => observer.disconnect();
+  return () => {
+    observer.disconnect();
+    cancelAnimationFrame(view.frameId);
+    clearTimeout(view.hintTimer);
+  };
 }
 
 export default { render };
