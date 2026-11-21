@@ -71,6 +71,7 @@ function paddedDomain([min, max]) {
 }
 
 function rescaleAxes(view) {
+  if (view.activeCount === 0 && view.domains) return;
   const { columns } = view.data;
   view.domains = columns.map((column) =>
     paddedDomain(columnExtent(column, view.active, view.activeCount)),
@@ -500,6 +501,33 @@ export function selectRows(selection, columns, active, activeCount, mask, out) {
   return collectLasso(xs, ys, selection.polygon, active, activeCount, mask, out);
 }
 
+function applyFilterStep(op, mask, active, count) {
+  const keepValue = op === "keep" ? 1 : 0;
+  let kept = 0;
+  for (let k = 0; k < count; k++) {
+    const r = active[k];
+    if (mask[r] === keepValue) active[kept++] = r;
+  }
+  return kept;
+}
+
+export function replayFilters(filters, columns, active, mask, scratch) {
+  let count = active.length;
+  for (let r = 0; r < count; r++) active[r] = r;
+  for (const { op, selection } of filters) {
+    selectRows(selection, columns, active, count, mask, scratch);
+    count = applyFilterStep(op, mask, active, count);
+  }
+  mask.fill(0);
+  return count;
+}
+
+function applyFilters(view) {
+  view.activeCount = replayFilters(
+    view.filters, view.data.columns, view.active, view.mask, view.selected,
+  );
+}
+
 function fractionToData(view, feature, fraction) {
   const [min, max] = view.domains[feature];
   return min + fraction * (max - min);
@@ -745,6 +773,7 @@ function onPointerUp(view, event) {
   renderOverlay(view);
   renderStatus(view);
   updateToolbar(view);
+  syncToPython(view);
   logBrushStats(view);
 }
 
@@ -840,14 +869,13 @@ function buildSegment(view, entries) {
 }
 
 function buildToolbar(view) {
-  const noop = () => {};
   view.toolbar.append(
     buildSegment(view, [
-      { id: "keep", label: "Keep", onClick: noop },
-      { id: "exclude", label: "Exclude", onClick: noop },
-      { id: "clear", label: "Clear", onClick: noop },
+      { id: "keep", label: "Keep", onClick: () => pushFilter(view, "keep") },
+      { id: "exclude", label: "Exclude", onClick: () => pushFilter(view, "exclude") },
+      { id: "clear", label: "Clear", onClick: () => dropSelection(view) },
     ]),
-    buildSegment(view, [{ id: "reset", label: "Reset", onClick: noop }]),
+    buildSegment(view, [{ id: "reset", label: "Reset", onClick: () => resetFilters(view) }]),
     buildSegment(view, [
       { id: "box", label: "Box", onClick: () => setBrushMode(view, "box") },
       { id: "lasso", label: "Lasso", onClick: () => setBrushMode(view, "lasso") },
@@ -861,7 +889,8 @@ function buildToolbar(view) {
 
 function updateToolbar(view) {
   const { buttons } = view;
-  for (const id of ["keep", "exclude", "clear", "reset"]) buttons[id].disabled = true;
+  for (const id of ["keep", "exclude", "clear"]) buttons[id].disabled = view.selection === null;
+  buttons.reset.disabled = view.filters.length === 0;
   buttons.box.classList.toggle("is-active", view.brushMode === "box");
   buttons.lasso.classList.toggle("is-active", view.brushMode === "lasso");
   buttons.full.classList.toggle("is-active", view.layoutMode === "full");
@@ -912,6 +941,59 @@ function renderStatus(view) {
   } else {
     view.status.replaceChildren(element("strong", "", count.toLocaleString("en-US")), suffix);
   }
+}
+
+function syncToPython(view) {
+  view.model.set("selection", view.selection);
+  view.model.set("filters", view.filters);
+  view.model.save_changes();
+}
+
+function refreshAfterFilterChange(view) {
+  applyFilters(view);
+  rescaleAxes(view);
+  computePixelCoords(view);
+  computeBins(view);
+  buildColorLayer(view);
+  renderFrame(view, false);
+  renderLabels(view);
+  renderOverlay(view);
+  renderStatus(view);
+  updateToolbar(view);
+  syncToPython(view);
+}
+
+function pushFilter(view, op) {
+  if (view.selection === null) return;
+  view.filters = [...view.filters, { op, selection: view.selection }];
+  clearSelection(view);
+  refreshAfterFilterChange(view);
+}
+
+function resetFilters(view) {
+  if (view.filters.length === 0) return;
+  view.filters = [];
+  clearSelection(view);
+  refreshAfterFilterChange(view);
+}
+
+function dropSelection(view) {
+  if (view.selection === null) return;
+  clearSelection(view);
+  renderFrame(view, false);
+  renderOverlay(view);
+  renderStatus(view);
+  updateToolbar(view);
+  syncToPython(view);
+}
+
+function restoreSelection(view) {
+  const selection = view.model.get("selection");
+  if (!selection) return;
+  view.selection = selection;
+  view.selectedCount = selectRows(
+    selection, view.data.columns, view.active, view.activeCount, view.mask, view.selected,
+  );
 }
 
 function setBrushMode(view, mode) {
@@ -992,7 +1074,7 @@ function createView(model, el) {
     layoutMode: "full",
     selection: null,
     selectedCount: 0,
-    filters: [],
+    filters: model.get("filters") ?? [],
     drag: null,
     hover: null,
     frameId: 0,
@@ -1034,7 +1116,9 @@ function renderAll(view) {
 function render({ model, el }) {
   const view = createView(model, el);
   selectGrouping(view, model.get("color"));
+  applyFilters(view);
   rescaleAxes(view);
+  restoreSelection(view);
   buildToolbar(view);
   updateToolbar(view);
   renderLegend(view);

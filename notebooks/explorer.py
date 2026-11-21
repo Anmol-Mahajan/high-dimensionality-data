@@ -67,5 +67,18 @@ def _(PairPlot, df, mo):
     return (pp,)
 
 
+@app.cell(hide_code=True)
+def _(mo, pp):
+    table = "\n".join(
+        [
+            "| group | selected rows |",
+            "|---|---:|",
+            *(f"| {label} | {count:,} |" for label, count in pp.group_counts().items()),
+        ]
+    )
+    mo.md(f"### Filter pipeline\n\n{pp.pipeline_text()}\n\n{table}")
+    return
+
+
 if __name__ == "__main__":
     app.run()

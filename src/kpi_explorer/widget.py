@@ -11,6 +11,13 @@ import numpy as np
 import polars as pl
 import traitlets
 
+from kpi_explorer.selection import (
+    describe_pipeline,
+    describe_selection,
+    filter_mask,
+    selection_mask,
+)
+
 _STATIC = Path(__file__).parent / "static"
 _MAX_CATEGORIES = 32
 _DEFAULT_MAX_COLUMNS = 8
@@ -116,6 +123,8 @@ class PairPlot(anywidget.AnyWidget):
         # Rows are sent in random order so that no group is systematically drawn on top.
         order = rng.permutation(rows.size)
         encoded = [_encode_groups(frame[name][rows]) for name in options]
+        self._order = order
+        self._encoded_groups = dict(zip(options, encoded, strict=True))
         super().__init__(
             _meta={
                 "rows": int(rows.size),
@@ -140,3 +149,48 @@ class PairPlot(anywidget.AnyWidget):
             if dtype.is_numeric() and name not in exclude
         ]
         return numeric[:_DEFAULT_MAX_COLUMNS]
+
+    def _filter_mask(self) -> np.ndarray:
+        """Return a mask over the widget's rows for the current filter stack."""
+        return filter_mask(self.filters, self._matrix)
+
+    def _selected_mask(self) -> np.ndarray:
+        """Return a mask of rows in the live selection and the filter stack."""
+        mask = self._filter_mask()
+        if self.selection:
+            mask &= selection_mask(self.selection, self._matrix)
+        return mask
+
+    def filtered_indices(self) -> np.ndarray:
+        """Return row indices of the source frame that pass the filter stack."""
+        return self._rows[self._filter_mask()]
+
+    def selected_indices(self) -> np.ndarray:
+        """Return source-frame row indices in the selection and the filter stack.
+
+        When nothing is selected, this is every row that passes the filter stack.
+        """
+        return self._rows[self._selected_mask()]
+
+    def filtered_df(self) -> pl.DataFrame:
+        """Return the rows that pass the filter stack."""
+        return self._frame[self.filtered_indices()]
+
+    def selected_df(self) -> pl.DataFrame:
+        """Return the rows in the selection and the filter stack."""
+        return self._frame[self.selected_indices()]
+
+    def group_counts(self) -> dict[str, int]:
+        """Count selected rows per label of the current colour-by column."""
+        codes, labels = self._encoded_groups[self.color]
+        counts = np.bincount(codes[self._selected_mask()], minlength=len(labels))
+        return {label: int(count) for label, count in zip(labels, counts, strict=True)}
+
+    def pipeline_text(self) -> str:
+        """Describe the filter pipeline and any live selection in one sentence."""
+        remaining = int(self._filter_mask().sum())
+        text = describe_pipeline(self.filters, remaining, int(self._rows.size))
+        if self.selection:
+            selected = int(self._selected_mask().sum())
+            text += f". Live selection: {describe_selection(self.selection)} ({selected:,} rows)"
+        return text

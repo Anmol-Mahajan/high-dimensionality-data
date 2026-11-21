@@ -179,8 +179,12 @@ telecom-kpi-explorer/
 **Public API**
 ```python
 from kpi_explorer import PairPlot
+
 pp = mo.ui.anywidget(PairPlot(df, columns=[...], color="true_state", max_points=None))
-pp.selection; pp.filters; pp.selected_indices(); pp.filtered_df()
+pp.selection
+pp.filters
+pp.selected_indices()
+pp.filtered_df()
 ```
 
 ---
