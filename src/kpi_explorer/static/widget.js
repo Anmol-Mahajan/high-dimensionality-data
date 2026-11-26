@@ -922,7 +922,11 @@ function buildSegment(view, entries) {
     const button = element("button", "kpi-btn", label);
     button.type = "button";
     if (title) button.title = title;
-    button.addEventListener("click", onClick);
+    button.addEventListener("click", () => {
+      onClick();
+      // A disabled button drops focus, which would stop the keyboard shortcuts working.
+      if (button.disabled) view.root.focus({ preventScroll: true });
+    });
     view.buttons[id] = button;
     segment.append(button);
   }

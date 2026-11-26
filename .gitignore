@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local LinkedIn post drafts and images
+linkedin/
+
 # Tool caches and capture scratch space
 .pytest_cache/
 .ruff_cache/

@@ -32,6 +32,18 @@ VIEWPORT = {"width": 1200, "height": 1200}
 STROKE_STEPS = 40
 LASSO_STEPS = 72
 LATENCY, RSRP, SINR = 0, 1, 2
+RESULTS_CURSOR = (840.0, 1120.0)
+
+FIND_SCROLLER = """
+const findScroller = () => {
+  let box = window.__kpiView.root.parentElement;
+  while (box && !(box.scrollHeight > box.clientHeight + 4 &&
+         /auto|scroll/.test(getComputedStyle(box).overflowY))) {
+    box = box.parentElement ?? box.getRootNode().host;
+  }
+  return box ?? document.scrollingElement;
+};
+"""
 
 # Headless Chromium does not paint the OS cursor, so a visible one is drawn in the page.
 CURSOR_SCRIPT = """
@@ -167,12 +179,13 @@ class Director:
         center: tuple[float, float],
         radii: tuple[float, float],
         seconds: float = 1.7,
+        steps: int = LASSO_STEPS,
     ) -> None:
         """Draw a slightly wobbly closed loop around a point, like a hand would."""
         phases = [self.random.uniform(0, math.tau) for _ in range(2)]
         outline = []
-        for step in range(LASSO_STEPS + 1):
-            angle = -math.pi * 0.75 + math.tau * step / LASSO_STEPS
+        for step in range(steps + 1):
+            angle = -math.pi * 0.75 + math.tau * step / steps
             wobble = (
                 1 + 0.035 * math.sin(3 * angle + phases[0]) + 0.02 * math.sin(5 * angle + phases[1])
             )
@@ -189,7 +202,7 @@ class Director:
         started = time.monotonic()
         for step, point in enumerate(points[1:], start=1):
             await self.page.mouse.move(*point)
-            await pace(started, seconds, step, LASSO_STEPS)
+            await pace(started, seconds, step, steps)
         await self.page.mouse.up()
         self.position = points[-1]
 
@@ -222,14 +235,10 @@ class Director:
     async def scroll_to(self, top: float, seconds: float = 0.7) -> None:
         """Smoothly scroll marimo's page container to a position."""
         await self.page.evaluate(
-            """async ([top, seconds]) => {
-                const v = window.__kpiView;
-                let box = v.root.parentElement;
-                while (box && !(box.scrollHeight > box.clientHeight + 4 &&
-                       /auto|scroll/.test(getComputedStyle(box).overflowY))) {
-                    box = box.parentElement ?? box.getRootNode().host;
-                }
-                const scroller = box ?? document.scrollingElement;
+            "async ([top, seconds]) => {"
+            + FIND_SCROLLER
+            + """
+                const scroller = findScroller();
                 const from = scroller.scrollTop;
                 const started = performance.now();
                 await new Promise((done) => {
@@ -247,18 +256,63 @@ class Director:
     async def widget_scroll_top(self, offset: float = 12) -> float:
         """Return the scroll position that places the widget ``offset`` px below the top."""
         return await self.page.evaluate(
-            """(offset) => {
-                const v = window.__kpiView;
-                let box = v.root.parentElement;
-                while (box && !(box.scrollHeight > box.clientHeight + 4 &&
-                       /auto|scroll/.test(getComputedStyle(box).overflowY))) {
-                    box = box.parentElement ?? box.getRootNode().host;
-                }
-                const scroller = box ?? document.scrollingElement;
-                return scroller.scrollTop + v.root.getBoundingClientRect().top - offset;
+            "(offset) => {"
+            + FIND_SCROLLER
+            + """
+                const top = window.__kpiView.root.getBoundingClientRect().top;
+                return findScroller().scrollTop + top - offset;
             }""",
             offset,
         )
+
+    async def results_scroll_top(self) -> float:
+        """Return the scroll position that brings the last results table into view."""
+        return await self.page.evaluate(
+            "() => {"
+            + FIND_SCROLLER
+            + """
+                const scroller = findScroller();
+                const tables = [];
+                const walk = (root) => root.querySelectorAll('*').forEach((node) => {
+                    if (node.tagName === 'TABLE') tables.push(node);
+                    if (node.shadowRoot) walk(node.shadowRoot);
+                });
+                walk(document);
+                const bottom = Math.max(...tables.map((t) => t.getBoundingClientRect().bottom));
+                const target = scroller.scrollTop + bottom + 24 - window.innerHeight;
+                return Math.max(0, Math.min(target, scroller.scrollHeight - scroller.clientHeight));
+            }"""
+        )
+
+    async def wait_for_results(self) -> None:
+        """Wait until the reactive Python cells show the widget's current counts."""
+        await self.page.wait_for_function(
+            """() => {
+                const v = window.__kpiView;
+                const format = (n) => n.toLocaleString('en-US');
+                const expected = v.selection
+                    ? `(${format(v.selectedCount)} rows)`
+                    : `${format(v.activeCount)} of ${format(v.data.rows)} rows remain`;
+                const roots = [document.body];
+                const collect = (root) => root.querySelectorAll('*').forEach((node) => {
+                    if (node.shadowRoot) {
+                        roots.push(node.shadowRoot);
+                        collect(node.shadowRoot);
+                    }
+                });
+                collect(document);
+                return roots.some((root) => root.textContent.includes(expected));
+            }""",
+            polling=100,
+            timeout=10_000,
+        )
+
+    async def show_results(self, hold: float, seconds: float = 0.8) -> None:
+        """Move the cursor off the matrix, then scroll down to the updated results."""
+        await self.wait_for_results()
+        await self.glide(RESULTS_CURSOR, seconds=0.3)
+        await self.scroll_to(await self.results_scroll_top(), seconds=seconds)
+        await self.hold(hold)
 
     async def status(self) -> str:
         return await self.page.locator(".kpi-status").inner_text()
@@ -273,22 +327,23 @@ async def wait_for_widget(page: Page) -> None:
 
 async def take_overview(director: Director) -> None:
     await director.hold(0.5)
-    await director.scroll_to(await director.widget_scroll_top(), seconds=0.9)
+    await director.scroll_to(await director.widget_scroll_top(), seconds=0.8)
     await director.hold(2.0)
     await director.click("Lower")
-    await director.hold(1.2)
+    await director.hold(0.8)
     await director.click("Full")
-    await director.hold(1.0)
+    await director.hold(0.4)
+    await director.show_results(hold=1.3)
 
 
 async def take_lasso(director: Director) -> None:
     await director.scroll_to(await director.widget_scroll_top(), seconds=0.01)
-    await director.hold(0.6)
+    await director.hold(0.5)
     await director.click("Lasso")
-    await director.hold(0.25)
-    await director.lasso(SINR, RSRP, (-86.0, 2.2), (15.0, 5.4), seconds=2.0)
-    await director.glide((director.position[0] + 150, director.position[1] - 215), seconds=0.6)
-    await director.hold(2.6)
+    await director.hold(0.15)
+    await director.lasso(SINR, RSRP, (-86.0, 2.2), (15.0, 5.4), seconds=1.8)
+    await director.hold(0.7)
+    await director.show_results(hold=2.2)
 
 
 async def take_filter_stack(director: Director) -> None:
@@ -300,40 +355,38 @@ async def take_filter_stack(director: Director) -> None:
     await director.drag_line((start, y), (end, y), seconds=0.55)
     await director.hold(0.15)
     await director.click("Keep")
-    await director.hold(0.35)
-    await director.click("Lasso")
-    await director.lasso(SINR, RSRP, (-112.0, 1.5), (13.0, 7.2), seconds=0.75)
-    await director.hold(0.05)
+    await director.hold(0.2)
+    await director.page.keyboard.press("l")
+    await director.lasso(SINR, RSRP, (-112.0, 1.5), (13.0, 7.2), seconds=0.7, steps=40)
     await director.click("Exclude")
+    await director.hold(0.15)
+    await director.show_results(hold=1.25, seconds=0.55)
+    await director.page.keyboard.press("r")
+    await director.wait_for_results()
     await director.hold(0.45)
-    await director.click("Reset")
-    await director.hold(0.25)
 
 
 async def take_python_sync(director: Director) -> None:
-    top = await director.widget_scroll_top()
-    await director.scroll_to(top, seconds=0.01)
+    await director.scroll_to(await director.widget_scroll_top(), seconds=0.01)
     await director.hold(0.4)
     await director.click("Lasso")
     await director.lasso(SINR, RSRP, (-86.0, 2.2), (15.0, 5.4), seconds=1.4)
-    await director.hold(0.3)
-    await director.scroll_to(top + 300, seconds=0.7)
-    await director.hold(1.5)
+    await director.hold(0.4)
+    await director.show_results(hold=1.5)
     await director.page.keyboard.press("x")
-    await director.hold(2.0)
+    await director.wait_for_results()
+    await director.hold(1.8)
 
 
 async def take_cluster_vs_truth(director: Director) -> None:
-    top = await director.widget_scroll_top()
-    await director.scroll_to(top, seconds=0.01)
-    await director.hold(0.5)
+    await director.scroll_to(await director.widget_scroll_top(), seconds=0.01)
+    await director.hold(0.3)
     await director.choose_color("cluster")
-    await director.hold(0.8)
-    await director.click("Lasso")
-    await director.lasso(SINR, RSRP, (-86.0, 2.2), (15.0, 5.4), seconds=1.5)
     await director.hold(0.5)
-    await director.scroll_to(top + 300, seconds=0.8)
-    await director.hold(2.4)
+    await director.click("Lasso")
+    await director.lasso(SINR, RSRP, (-86.0, 2.2), (15.0, 5.4), seconds=1.3)
+    await director.hold(0.4)
+    await director.show_results(hold=2.2)
 
 
 @dataclass(frozen=True)
